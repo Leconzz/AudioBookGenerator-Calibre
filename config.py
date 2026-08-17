@@ -1,0 +1,168 @@
+from qt.core import QWidget, QHBoxLayout, QLabel, QComboBox, QVBoxLayout, QPushButton, QCheckBox, QFileDialog
+from calibre.utils.config import JSONConfig
+
+# Initialize the config object. 
+prefs = JSONConfig('plugins/audiobook_generator')
+
+# Set default values
+prefs.defaults['language'] = 'English'
+prefs.defaults['tts_engine'] = 'Edge TTS'
+prefs.defaults['voice_gender'] = 'Male'
+prefs.defaults['output_format'] = 'MP3'
+prefs.defaults['audio_quality'] = 'Standard'
+prefs.defaults['detect_language'] = False
+prefs.defaults['storage_mode'] = 'Internal'
+prefs.defaults['unified_folder_path'] = ''
+
+class ConfigWidget(QWidget):
+    def __init__(self, plugin_action=None):
+        QWidget.__init__(self)
+        self.plugin_action = plugin_action
+        self.l = QVBoxLayout()
+        self.setLayout(self.l)
+
+        # 1. Output Format Selection
+        self.h0 = QHBoxLayout()
+        self.l.addLayout(self.h0)
+        self.format_label = QLabel('Output Format:')
+        self.h0.addWidget(self.format_label)
+        self.format_combo = QComboBox(self)
+        self.format_combo.addItems(['MP3', 'M4B'])
+        index = self.format_combo.findText(prefs['output_format'])
+        if index >= 0:
+            self.format_combo.setCurrentIndex(index)
+        self.h0.addWidget(self.format_combo)
+
+        # 1b. Audio Quality (Edge TTS)
+        self.hq = QHBoxLayout()
+        self.l.addLayout(self.hq)
+        self.quality_label = QLabel('Audio Quality (Edge TTS):')
+        self.hq.addWidget(self.quality_label)
+        self.quality_combo = QComboBox(self)
+        self.quality_combo.addItems(['Standard', 'High'])
+        stored_quality = prefs['audio_quality']
+        if stored_quality == 'Low': stored_quality = 'Standard'
+        index = self.quality_combo.findText(stored_quality)
+        if index >= 0:
+            self.quality_combo.setCurrentIndex(index)
+        self.hq.addWidget(self.quality_combo)
+
+        # 2. TTS Engine Selection
+        self.h1 = QHBoxLayout()
+        self.l.addLayout(self.h1)
+        self.engine_label = QLabel('TTS Engine:')
+        self.h1.addWidget(self.engine_label)
+        self.engine_combo = QComboBox(self)
+        self.engine_combo.addItems(['Edge TTS', 'gTTS', 'VibeVoice'])
+        index = self.engine_combo.findText(prefs['tts_engine'])
+        if index >= 0:
+            self.engine_combo.setCurrentIndex(index)
+        self.h1.addWidget(self.engine_combo)
+
+        # 3. Voice Gender Selection
+        self.h2 = QHBoxLayout()
+        self.l.addLayout(self.h2)
+        self.gender_label = QLabel('Voice Gender (Edge TTS only):')
+        self.h2.addWidget(self.gender_label)
+        self.gender_combo = QComboBox(self)
+        self.gender_combo.addItems(['Male', 'Female'])
+        index = self.gender_combo.findText(prefs['voice_gender'])
+        if index >= 0:
+            self.gender_combo.setCurrentIndex(index)
+        self.h2.addWidget(self.gender_combo)
+        
+        # Update UI based on engine selection
+        self.engine_combo.currentTextChanged.connect(self.update_engine_ui)
+        self.update_engine_ui(self.engine_combo.currentText())
+
+        # 4. Target Language Selection
+        self.h3 = QHBoxLayout()
+        self.l.addLayout(self.h3)
+        self.label = QLabel('Target Language:')
+        self.h3.addWidget(self.label)
+        self.language_combo = QComboBox(self)
+        self.language_combo.addItems(['English', 'Spanish (Latam)', 'Spanish (Spain)', 'Portuguese', 'French', 'Italian'])
+        index = self.language_combo.findText(prefs['language'])
+        if index >= 0:
+            self.language_combo.setCurrentIndex(index)
+        self.h3.addWidget(self.language_combo)
+
+        # 4b. Detect Language from Book
+        self.h4 = QHBoxLayout()
+        self.l.addLayout(self.h4)
+        self.detect_language_checkbox = QCheckBox('Detect language from book metadata', self)
+        self.detect_language_checkbox.setChecked(prefs['detect_language'])
+        self.detect_language_checkbox.setToolTip('If checked, the plugin will try to use the language defined in the book metadata.')
+        self.h4.addWidget(self.detect_language_checkbox)
+
+        # 4c. Storage Mode
+        self.h5 = QHBoxLayout()
+        self.l.addLayout(self.h5)
+        self.storage_label = QLabel('Storage Mode:')
+        self.h5.addWidget(self.storage_label)
+        self.storage_combo = QComboBox(self)
+        self.storage_combo.addItems(['Internal (Calibre Book Folder)', 'External (Unified Folder)'])
+        stored_mode = 'Internal (Calibre Book Folder)' if prefs['storage_mode'] == 'Internal' else 'External (Unified Folder)'
+        index = self.storage_combo.findText(stored_mode)
+        if index >= 0:
+            self.storage_combo.setCurrentIndex(index)
+        self.storage_combo.currentIndexChanged.connect(self.update_storage_ui)
+        self.h5.addWidget(self.storage_combo)
+
+        # 4d. Unified Folder Path
+        self.h6 = QHBoxLayout()
+        self.l.addLayout(self.h6)
+        self.folder_label = QLabel('Unified Folder:')
+        self.h6.addWidget(self.folder_label)
+        self.folder_edit = QLabel(prefs['unified_folder_path'] or 'Not Selected')
+        self.folder_edit.setFrameStyle(QLabel.Shape.StyledPanel | QLabel.Shadow.Sunken)
+        self.h6.addWidget(self.folder_edit)
+        self.folder_button = QPushButton('Browse...', self)
+        self.folder_button.clicked.connect(self.browse_folder)
+        self.h6.addWidget(self.folder_button)
+
+        # Set initial UI state
+        self.update_storage_ui()
+        self.update_engine_ui(self.engine_combo.currentText())
+        
+        self.l.addSpacing(20)
+        
+        # 5. Sync Button
+        self.sync_button = QPushButton('Sync All Audiobook Icons', self)
+        self.sync_button.setToolTip('Scan entire library for audiobooks and add cassette icons to covers')
+        self.sync_button.clicked.connect(self.run_sync)
+        self.l.addWidget(self.sync_button)
+        
+        self.l.addStretch(1)
+
+    def update_storage_ui(self):
+        is_external = 'External' in self.storage_combo.currentText()
+        self.folder_label.setEnabled(is_external)
+        self.folder_edit.setEnabled(is_external)
+        self.folder_button.setEnabled(is_external)
+    
+    def update_engine_ui(self, engine):
+        is_edge = engine == 'Edge TTS'
+        self.gender_label.setEnabled(is_edge)
+        self.gender_combo.setEnabled(is_edge)
+        self.quality_label.setEnabled(is_edge)
+        self.quality_combo.setEnabled(is_edge)
+
+    def browse_folder(self):
+        f = QFileDialog.getExistingDirectory(self, 'Select Unified Folder', self.folder_edit.text())
+        if f:
+            self.folder_edit.setText(f)
+
+    def run_sync(self):
+        if self.plugin_action:
+            self.plugin_action.sync_all_icons()
+
+    def save_settings(self):
+        prefs['language'] = self.language_combo.currentText()
+        prefs['tts_engine'] = self.engine_combo.currentText()
+        prefs['voice_gender'] = self.gender_combo.currentText()
+        prefs['output_format'] = self.format_combo.currentText()
+        prefs['audio_quality'] = self.quality_combo.currentText()
+        prefs['detect_language'] = self.detect_language_checkbox.isChecked()
+        prefs['storage_mode'] = 'Internal' if 'Internal' in self.storage_combo.currentText() else 'External'
+        prefs['unified_folder_path'] = self.folder_edit.text() if self.folder_edit.text() != 'Not Selected' else ''
