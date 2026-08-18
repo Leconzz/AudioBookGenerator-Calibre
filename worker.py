@@ -1,11 +1,12 @@
 import sys
 import os
-import shutil
 import asyncio
 import traceback
 import time
 import re
 import unicodedata
+import shutil
+import threading
 
 # def main(epub_path, output_path, voice, engine, lang_code, vendor_path, book_id, output_format, audio_quality, notifications, abort, log):
 #     """
@@ -162,7 +163,65 @@ import unicodedata
 #         log(f"CRITICAL ERROR: {traceback.format_exc()}")
 #         return False, (book_id, output_format, str(e))
     
-def main(epub_path, output_path, voice, engine, lang_code, vendor_path, book_id, output_format, audio_quality, ffmpeg_path, notifications, abort, log):
+def sanitize_filename(name):
+    cleaned = "".join(c for c in name if c.isalnum() or c in (' ', '-', '_')).strip()
+    return cleaned or "Untitled"
+
+def load_or_create_volume_plan(epub_path, chapters, log):
+    """Returns (plan, just_generated). plan is a list of {'name': str, 'chapters': int}
+    describing each volume, in order, or None (after logging the reason) on an invalid
+    existing config. just_generated is True when this call just wrote a fresh default
+    config — the caller should stop rather than run a real conversion against it."""
+    import json
+    base = os.path.splitext(epub_path)[0]
+    volumes_path = f"{base}_volumes.json"
+    chapter_list_path = f"{base}_chapter_list.txt"
+    total_chapters = len(chapters)
+
+    if os.path.exists(volumes_path):
+        try:
+            with open(volumes_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            plan = data.get('volumes', [])
+            if not plan:
+                log(f"ERROR: {volumes_path} has no 'volumes' entries.")
+                return None, False
+            plan_total = sum(v.get('chapters', 0) for v in plan)
+            if plan_total != total_chapters:
+                log(f"ERROR: Volume config chapter total ({plan_total}) does not match "
+                    f"the book's actual chapter count ({total_chapters}). "
+                    f"Fix {volumes_path} (or delete it to regenerate a default) and try again.")
+                return None, False
+            log(f"Using volume plan from: {volumes_path} ({len(plan)} volumes)")
+            return [{'name': v['name'], 'chapters': v['chapters']} for v in plan], False
+        except Exception as e:
+            log(f"ERROR: Could not read {volumes_path}: {e}")
+            return None, False
+
+    # No config yet — write a single volume containing every chapter, plus a chapter
+    # reference list, then signal the caller to stop rather than burn hours of TTS
+    # on a split you haven't decided on yet.
+    book_title = os.path.splitext(os.path.basename(epub_path))[0]
+    plan = [{'name': book_title, 'chapters': total_chapters}]
+
+    try:
+        with open(volumes_path, 'w', encoding='utf-8') as f:
+            json.dump({'volumes': plan}, f, indent=2)
+        log(f"Generated default volume plan: {volumes_path}")
+    except Exception as e:
+        log(f"Could not write volume plan file: {e}")
+
+    try:
+        with open(chapter_list_path, 'w', encoding='utf-8') as f:
+            for i, ch in enumerate(chapters):
+                f.write(f"{i:04d}: {ch['title']}\n")
+        log(f"Wrote chapter reference list: {chapter_list_path}")
+    except Exception as e:
+        log(f"Could not write chapter list file: {e}")
+
+    return plan, True
+
+def main(epub_path, output_path, voice, engine, lang_code, vendor_path, book_id, output_format, audio_quality, ffmpeg_path, split_by_volume, notifications, abort, log):
     if vendor_path not in sys.path:
         sys.path.insert(0, vendor_path)
 
@@ -181,6 +240,18 @@ def main(epub_path, output_path, voice, engine, lang_code, vendor_path, book_id,
         for ch in chapters:
             ch['text'] = clean_text_for_tts(ch['text'])
         log(f"Found {len(chapters)} chapters")
+
+        volume_plan = None
+        if split_by_volume:
+            volume_plan, just_generated = load_or_create_volume_plan(epub_path, chapters, log)
+            if volume_plan is None:
+                return False, (book_id, output_format, "Volume configuration error — see log for details.")
+            if just_generated:
+                base = os.path.splitext(epub_path)[0]
+                msg = (f"Volume plan created at {base}_volumes.json — edit it (checking "
+                       f"{base}_chapter_list.txt for chapter titles/indices), then run again.")
+                log(msg)
+                return False, (book_id, output_format, f"VOLUME_PLAN_GENERATED: {msg}")
 
         chunk_size = 5000
         for ch in chapters:
@@ -230,7 +301,7 @@ def main(epub_path, output_path, voice, engine, lang_code, vendor_path, book_id,
                         completed[0] += 1
                         notifications.put((0.1 + (completed[0] / total_chunks * 0.7),
                                             f"Generating audio: chapter {c_idx + 1} of {len(chapters)} "
-                                            f"({completed[0]} of {total_chunks} segments)"))
+                                            f"Downloaded {completed[0]} of {total_chunks} segments..."))
                     except Exception as e:
                         log(f"Error in chapter {c_idx} chunk {local_idx}: {str(e)}")
 
@@ -261,36 +332,80 @@ def main(epub_path, output_path, voice, engine, lang_code, vendor_path, book_id,
             path = os.path.join(book_temp_dir, f"chapter_{i:04d}.mp3")
             with open(path, 'wb') as f:
                 f.write(audio)
-            chapter_files.append({'path': path, 'title': ch['title']})
+            chapter_files.append({'path': path, 'title': ch['title'], 'chapter_index': i})
 
         if not chapter_files:
             return False, (book_id, output_format, "Audio generation failed or was aborted.")
 
-        notifications.put((0.85, "Assembling audiobook..."))
+        output_dir = os.path.dirname(output_path)
+        ext = output_format.lower()
 
-        if output_format.upper() == 'M4B':
-            ok = build_m4b(chapter_files, output_path, vendor_path, ffmpeg_path, metadata, notifications, log)
+        if split_by_volume:
+            volumes = []
+            idx = 0
+            for v in volume_plan:
+                count = v['chapters']
+                start, end = idx, idx + count
+                vol_files = [cf for cf in chapter_files if start <= cf['chapter_index'] < end]
+                volumes.append({'name': v['name'], 'files': vol_files})
+                idx = end
         else:
-            with open(output_path, 'wb') as out:
-                for cf in chapter_files:
-                    with open(cf['path'], 'rb') as f:
-                        out.write(f.read())
-            ok = True
+            volumes = [{'name': None, 'files': chapter_files}]
 
-        if ok:
+        log(f"Assembling {len(volumes)} volume(s)...")
+
+        output_paths = []
+        all_ok = True
+        for vol_idx, vol in enumerate(volumes):
+            vol_num = vol_idx + 1
+            vol_chapters = vol['files']
+            if not vol_chapters:
+                log(f"Volume {vol_num} ('{vol['name']}') has no chapters — skipping.")
+                continue
+
+            if vol['name']:
+                safe_name = sanitize_filename(vol['name'])
+                vol_output_path = os.path.join(output_dir, f"{safe_name}.{ext}")
+            else:
+                vol_output_path = output_path
+
+            vol_metadata = dict(metadata)
+            if vol['name']:
+                vol_metadata['title'] = vol['name']
+
+            progress_base = 0.85 + (vol_idx / len(volumes)) * 0.15
+            progress_span = 0.15 / len(volumes)
+            notifications.put((progress_base, f"Assembling volume {vol_num} of {len(volumes)}..."))
+
+            if output_format.upper() == 'M4B':
+                vol_ok = build_m4b(vol_chapters, vol_output_path, vendor_path, ffmpeg_path, vol_metadata,
+                                    notifications, log, progress_base=progress_base, progress_span=progress_span)
+            else:
+                with open(vol_output_path, 'wb') as out:
+                    for cf in vol_chapters:
+                        with open(cf['path'], 'rb') as f:
+                            out.write(f.read())
+                vol_ok = True
+
+            if vol_ok and os.path.exists(vol_output_path) and os.path.getsize(vol_output_path) > 0:
+                if output_format.upper() != 'M4B':
+                    strip_audio_tags(vol_output_path, vendor_path)
+                output_paths.append(vol_output_path)
+            else:
+                all_ok = False
+                log(f"Volume {vol_num} ('{vol['name']}') failed to assemble.")
+
+        if all_ok:
             try:
                 shutil.rmtree(book_temp_dir)
             except Exception as e:
                 log(f"Could not remove temp folder: {e}")
         else:
-            log(f"Assembly failed — keeping {len(chapter_files)} chapter audio files so you don't have to redo TTS.")
-            log(f"Location: {book_temp_dir}")
+            log(f"Assembly failed for one or more volumes — chapter audio kept at: {book_temp_dir}")
 
-        if ok and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            if output_format.upper() != 'M4B':
-                strip_audio_tags(output_path, vendor_path)
-            log("SUCCESS: Generation finished.")
-            return True, (book_id, output_format, output_path)
+        if all_ok and output_paths:
+            log(f"SUCCESS: Generated {len(output_paths)} volume(s).")
+            return True, (book_id, output_format, output_paths if len(output_paths) > 1 else output_paths[0])
         else:
             return False, (book_id, output_format, "Audio generation failed or was aborted.")
 
@@ -360,6 +475,7 @@ def extract_chapters(epub_path, log):
 
     TOC_TITLE_HINTS = {'table of contents', 'contents', 'toc'}
     TOC_EXACT_NAME_HINTS = {'toc', 'nav', 'contents', 'tableofcontents', 'table_of_contents'}
+    TOC_NAME_HINTS = ('toc', 'contents', 'nav')
 
     try:
         container = get_container(epub_path)
@@ -375,6 +491,10 @@ def extract_chapters(epub_path, log):
         for name in spine_names:
             if cover_page and name == cover_page:
                 continue
+            if any(hint in name.lower() for hint in TOC_NAME_HINTS):
+                log(f"Skipping likely TOC/nav page: {name}")
+                continue
+
             name_stem = os.path.splitext(os.path.basename(name))[0].lower()
             if name_stem in TOC_EXACT_NAME_HINTS:
                 log(f"Skipping likely TOC/nav page: {name}")
@@ -413,7 +533,7 @@ def extract_chapters(epub_path, log):
     except Exception:
         return None
 
-def build_m4b(chapter_files, output_path, vendor_path, ffmpeg_path, metadata, notifications, log):
+def build_m4b(chapter_files, output_path, vendor_path, ffmpeg_path, metadata, notifications, log, progress_base=0.85, progress_span=0.15):
     import subprocess
     if vendor_path not in sys.path:
         sys.path.insert(0, vendor_path)
@@ -483,20 +603,35 @@ def build_m4b(chapter_files, output_path, vendor_path, ffmpeg_path, metadata, no
 
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        stderr_lines = []
+        def drain_stderr():
+            
+            for line in proc.stderr:
+                stderr_lines.append(line)
+        stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+        stderr_thread.start()
+
+        last_logged_pct = -1
         for line in proc.stdout:
             line = line.strip()
             if line.startswith('out_time_ms='):
                 try:
-                    elapsed_ms = int(line.split('=')[1]) / 1000  # ffmpeg reports microseconds
+                    elapsed_ms = int(line.split('=')[1]) / 1000
                     pct = min(elapsed_ms / total_duration_ms, 1.0)
                     chapter_title = find_current_chapter(elapsed_ms)
-                    notifications.put((0.85 + pct * 0.15,
+                    notifications.put((progress_base + pct * progress_span,
                                         f"Encoding audiobook: {pct * 100:.0f}% (around \"{chapter_title}\")"))
+                    pct_rounded = int(pct * 100)
+                    if pct_rounded != last_logged_pct:
+                        log(f"Encoding: {pct_rounded}% (around \"{chapter_title}\")")
+                        last_logged_pct = pct_rounded
                 except (ValueError, IndexError, ZeroDivisionError):
                     pass
 
         proc.wait()
-        stderr_output = proc.stderr.read()
+        stderr_thread.join(timeout=5)
+        stderr_output = "".join(stderr_lines)
         if proc.returncode != 0:
             log(f"ffmpeg error: {stderr_output[-2000:]}")
             return False

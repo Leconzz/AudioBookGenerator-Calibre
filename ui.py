@@ -146,10 +146,11 @@ class InterfacePlugin(InterfaceAction):
             return error_dialog(self.gui, 'No EPUB found', 'This book does not have an EPUB format.', show=True)
 
         import tempfile
-        with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as tf:
-            temp_mp3 = tf.name
+        temp_dir = tempfile.mkdtemp(prefix='calibre_audiobook_out_')
+        temp_output = os.path.join(temp_dir, f'output.{output_format.lower()}')
 
         ffmpeg_path = self.get_ffmpeg_path()
+        split_by_volume = prefs.get('split_by_volume', False)
 
         VOICE_MAPPING = {
             'English': {'Male': 'en-US-EricNeural', 'Female': 'en-US-AriaNeural', 'lang': 'en'},
@@ -167,10 +168,9 @@ class InterfacePlugin(InterfaceAction):
 
         callback = Dispatcher(self.on_job_finished)
 
-        ffmpeg_path = self.get_ffmpeg_path()
-
         job = ThreadedJob('audiobook_gen', f'Generating audiobook for "{title}"', worker_main, 
-                          [epub_path, temp_mp3, voice, engine, lang_code, vendor_path, book_id, output_format, audio_quality, ffmpeg_path], {}, 
+                          [epub_path, temp_output, voice, engine, lang_code, vendor_path, book_id, output_format, audio_quality,
+                           ffmpeg_path, split_by_volume], {}, 
                           callback)
         self.gui.job_manager.run_threaded_job(job)
         self.gui.status_bar.show_message(f'Audiobook Generator: Background job started for "{title}"', 3000)
@@ -186,31 +186,54 @@ class InterfacePlugin(InterfaceAction):
         except: return
 
         if not success:
-            self.gui.status_bar.show_message(f"Audiobook Generator: FAILED - {result_val}", 10000)
+            if isinstance(result_val, str) and result_val.startswith("VOLUME_PLAN_GENERATED:"):
+                msg = result_val[len("VOLUME_PLAN_GENERATED:"):].strip()
+                info_dialog(self.gui, 'Volume Plan Created', msg, show=True)
+                self.gui.status_bar.show_message('Audiobook Generator: Volume plan created — edit and run again.', 10000)
+            else:
+                self.gui.status_bar.show_message(f"Audiobook Generator: FAILED - {result_val}", 10000)
             return
 
-        temp_mp3 = result_val
+        import shutil
+        output_paths = result_val if isinstance(result_val, list) else [result_val]
+        multi_volume = len(output_paths) > 1
+        temp_dir = os.path.dirname(output_paths[0])
+
         try:
             db = self.gui.current_db.new_api
             storage_mode = prefs.get('storage_mode', 'Internal')
             unified_path = prefs.get('unified_folder_path', '')
+            mi = db.get_metadata(book_id)
+            safe_title = "".join([c for c in mi.title if c.isalnum() or c in (' ', '-', '_')]).strip()
+            safe_author = "".join([c for c in mi.authors[0] if c.isalnum() or c in (' ', '-', '_')]).strip()
 
-            if storage_mode == 'External' and unified_path and os.path.exists(unified_path):
-                import shutil
-                mi = db.get_metadata(book_id)
-                safe_title = "".join([c for c in mi.title if c.isalnum() or c in (' ', '-', '_')]).strip()
-                safe_author = "".join([c for c in mi.authors[0] if c.isalnum() or c in (' ', '-', '_')]).strip()
-                filename = f"{safe_title} - {safe_author}.{output_format.lower()}"
-                dest_path = os.path.join(unified_path, filename)
-                shutil.move(temp_mp3, dest_path)
-            else:
-                with open(temp_mp3, 'rb') as f:
-                    db.add_format(book_id, output_format, f, replace=True)
-                if os.path.exists(temp_mp3):
-                    os.remove(temp_mp3)
-            
+            for i, path in enumerate(output_paths):
+                vol_suffix = f" - Vol {i + 1}" if multi_volume else ""
+
+                if storage_mode == 'External' and unified_path and os.path.exists(unified_path):
+                    filename = f"{safe_title}{vol_suffix} - {safe_author}.{output_format.lower()}"
+                    shutil.move(path, os.path.join(unified_path, filename))
+                elif i == 0:
+                    # First (or only) file is registered as the book's actual Calibre format.
+                    with open(path, 'rb') as f:
+                        db.add_format(book_id, output_format, f, replace=True)
+                    os.remove(path)
+                else:
+                    # Calibre only tracks one file per format per book, so additional
+                    # volumes are placed directly in the book's own folder as extra files.
+                    book_dir = os.path.dirname(db.format_abspath(book_id, output_format))
+                    filename = f"{safe_title}{vol_suffix}.{output_format.lower()}"
+                    shutil.move(path, os.path.join(book_dir, filename))
+
+            try:
+                shutil.rmtree(temp_dir)
+            except Exception:
+                pass
+
             self.apply_emblem_to_book(book_id)
-            self.gui.status_bar.show_message('Audiobook Generator: SUCCESS - Finished and saved.', 10000)
+            msg = (f'Audiobook Generator: SUCCESS - {len(output_paths)} volumes saved.'
+                   if multi_volume else 'Audiobook Generator: SUCCESS - Finished and saved.')
+            self.gui.status_bar.show_message(msg, 10000)
         except Exception as e:
             self.gui.status_bar.show_message(f"Audiobook Generator: Error - {str(e)}", 10000)
 

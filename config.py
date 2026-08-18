@@ -13,6 +13,7 @@ prefs.defaults['audio_quality'] = 'Standard'
 prefs.defaults['detect_language'] = False
 prefs.defaults['storage_mode'] = 'Internal'
 prefs.defaults['unified_folder_path'] = ''
+prefs.defaults['split_by_volume'] = False
 
 class ConfigWidget(QWidget):
     def __init__(self, plugin_action=None):
@@ -121,6 +122,18 @@ class ConfigWidget(QWidget):
         self.folder_button.clicked.connect(self.browse_folder)
         self.h6.addWidget(self.folder_button)
 
+        # 4e. Split by Volume
+        self.h7 = QHBoxLayout()
+        self.l.addLayout(self.h7)
+        self.split_volume_checkbox = QCheckBox('Split output into multiple files by volume', self)
+        self.split_volume_checkbox.setChecked(prefs['split_by_volume'])
+        self.split_volume_checkbox.setToolTip(
+            'For books with thousands of chapters, a single M4B can crash ffmpeg from memory '
+            'exhaustion. The first run with this checked just writes a "_volumes.json" and '
+            '"_chapter_list.txt" next to the epub for you to edit (naming each volume and how '
+            'many chapters go in it), then stops. Rerun once you\'ve edited the volumes file.')
+        self.h7.addWidget(self.split_volume_checkbox)
+
         # Set initial UI state
         self.update_storage_ui()
         self.update_engine_ui(self.engine_combo.currentText())
@@ -166,3 +179,4 @@ class ConfigWidget(QWidget):
         prefs['detect_language'] = self.detect_language_checkbox.isChecked()
         prefs['storage_mode'] = 'Internal' if 'Internal' in self.storage_combo.currentText() else 'External'
         prefs['unified_folder_path'] = self.folder_edit.text() if self.folder_edit.text() != 'Not Selected' else ''
+        prefs['split_by_volume'] = self.split_volume_checkbox.isChecked()
